@@ -1,0 +1,16 @@
+{
+  "framework": null,
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/*.js": {
+      "maxDuration": 300
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/send-dept-report",
+      "schedule": "0 6 * * 1-5"
+    }
+  ]
+}

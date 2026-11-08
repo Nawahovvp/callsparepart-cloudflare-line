@@ -1,0 +1,465 @@
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { fetchAllData, fetchQuickData, sendOutsideRequest } from '../services/api';
+import { processRawData, calculateSummary, getCleanTeamPlant, normalizeMaterial, matchesDeptGroup, parseCallCreateDate } from '../utils/helpers';
+import { loadFromCache, saveAllToCache, saveToCache } from '../services/cacheService';
+
+export function useAppData() {
+    const [processedData, setProcessedData] = useState([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [lastUpdated, setLastUpdated] = useState(null);
+
+    // Single-value filters (matching original call.js behavior)
+    const [rawSources, setRawSources] = useState({ nawaRawData: [], poRawData: [], prRawData: [], engData: [] });
+    const [searchTerm, setSearchTerm] = useState('');
+    const [dashboardFilter, setDashboardFilter] = useState(null); // null = show all
+    const [teamPlantFilter, setTeamPlantFilter] = useState('');
+    const [pendingUnitFilter, setPendingUnitFilter] = useState('');
+    const [stockAnswerFilter, setStockAnswerFilter] = useState('');
+    const [statusCallFilter, setStatusCallFilter] = useState('');
+    const [gmFilter, setGmFilter] = useState(null); // New state for hierarchical filtering
+    const [deptGroupFilter, setDeptGroupFilter] = useState(() => {
+        const saved = localStorage.getItem('hideDeptCards') ?? localStorage.getItem('hideNonStockDept');
+        return (saved !== null ? saved === 'true' : true) ? 'Stock' : null;
+    });
+
+    const hasCacheLoaded = useRef(false);
+    const inFlightFetch = useRef(null);
+    const fetchGeneration = useRef(0);
+    const fullDataRef = useRef(null);
+
+    // Process fetched data (shared between cache load and server load)
+    const applyData = useCallback((fetchResult, saveCache = false, isPartial = false) => {
+        const completeData = isPartial && fullDataRef.current
+            ? {
+                ...fetchResult,
+                ...Object.fromEntries([
+                    'poData', 'prData', 'mainSapData', 'plantStockData',
+                    'newPartData', 'projectData', 'teamPlantData', 'engData'
+                ].map(key => [key, fullDataRef.current[key]]))
+            }
+            : fetchResult;
+        const {
+            mainData, requestData, poData, prData, mainSapData,
+            vipaData, nawaData, plantStockData, newPartData,
+            projectData, teamPlantData, engData
+        } = completeData;
+
+        // Skip processing if essential data is missing (e.g., empty cache)
+        if (!mainData || mainData.length === 0) return false;
+        if (!isPartial) fullDataRef.current = fetchResult;
+
+        const latestUpdate = Array.isArray(mainData)
+            ? mainData.reduce((latest, row) => {
+                const value = row?.['วันที่อัปเดต'];
+                const date = parseCallCreateDate(value);
+                return date && (!latest || date > latest.date)
+                    ? { date, value: String(value).trim() }
+                    : latest;
+            }, null)
+            : null;
+        setLastUpdated(latestUpdate?.value || null);
+
+        const processed = processRawData(
+            mainData, requestData, poData, prData, mainSapData,
+            vipaData, nawaData, plantStockData, newPartData,
+            projectData, teamPlantData, engData
+        );
+        setProcessedData(processed);
+        setRawSources({ nawaRawData: nawaData, poRawData: poData, prRawData: prData, plantStockData: plantStockData, engData: engData });
+
+        // Save ALL sources to cache for instant load next time
+        if (saveCache) {
+            saveAllToCache({
+                mainData, requestData, poData, prData, mainSapData, 
+                vipaData, nawaData, plantStockData, newPartData, 
+                projectData, teamPlantData, engData
+                });
+        }
+
+        localStorage.removeItem('app_cached_requestQuantities');
+        localStorage.removeItem('app_cached_requestByPlant');
+        return true;
+    }, []);
+
+    const fetchData = useCallback(async (showLoading = true, forceFresh = false) => {
+        // Routine refreshes reuse active work; a manual fresh refresh runs after it.
+        if (inFlightFetch.current) {
+            if (!forceFresh) return inFlightFetch.current;
+            await inFlightFetch.current;
+            if (inFlightFetch.current) return inFlightFetch.current;
+        }
+
+        if (showLoading) setIsLoading(true);
+        setError(null);
+        const generation = ++fetchGeneration.current;
+        const request = (async () => {
+            try {
+                try {
+                    const quickResult = await fetchQuickData({ fresh: forceFresh });
+                    if (fetchGeneration.current !== generation) return;
+                    applyData(quickResult, false, true);
+                    void saveToCache('quickData', {
+                        mainData: quickResult.mainData,
+                        requestData: quickResult.requestData,
+                        vipaData: quickResult.vipaData,
+                        nawaData: quickResult.nawaData
+                    });
+                    if (showLoading) setIsLoading(false);
+                } catch (quickError) {
+                    console.warn('[API] Quick data fetch failed; falling back to full data:', quickError);
+                }
+
+                const result = await fetchAllData({ fresh: forceFresh });
+                if (fetchGeneration.current === generation) {
+                    const applied = applyData(result, true);
+                    if (!applied) {
+                        setError('ไม่สามารถดึงข้อมูลจากเซิร์ฟเวอร์ได้ กรุณาลองใหม่อีกครั้ง');
+                    }
+                    if (showLoading) setIsLoading(false);
+                }
+            } catch (err) {
+                console.error(err);
+                setError('เกิดข้อผิดพลาดในการโหลดข้อมูล');
+            } finally {
+                if (showLoading) setIsLoading(false);
+                inFlightFetch.current = null;
+            }
+        })();
+        inFlightFetch.current = request;
+        return request;
+    }, [applyData]);
+
+    // Cache-first initialization
+    useEffect(() => {
+        const initData = async () => {
+            if (hasCacheLoaded.current) return;
+            hasCacheLoaded.current = true;
+
+            try {
+                // 1. Try to load from IndexedDB cache first
+                const quickData = await loadFromCache('quickData');
+                if (quickData?.mainData?.length) {
+                    applyData(quickData, false, true);
+                    console.log("[Cache-First] UI populated from quick stock cache; refreshing in background...");
+                    setIsLoading(false);
+                    fetchData(false);
+                } else {
+                    console.log("[Cache-First] No quick stock cache found, fetching server data...");
+                    fetchData(true);
+                }
+            } catch (err) {
+                console.warn("[Cache-First] Failed to initialize from cache:", err);
+                fetchData(true);
+            }
+        };
+
+        initData();
+
+        const interval = setInterval(() => fetchData(false), 5 * 60 * 1000);
+        return () => clearInterval(interval);
+    }, [fetchData, applyData]);
+
+    // --- Filtering Logic (matching original call.js exactly) ---
+
+    // Base filter: applies TeamPlant, PendingUnit, StockAnswer, StatusCall, and Search
+    // excludeType allows cross-filtering (skipping one filter to compute its options)
+    const getFilteredData = useCallback((excludeType = null) => {
+        return processedData.filter(row => {
+            if (!row) return false;
+            const ticket = row["Ticket Number"];
+            if (!ticket || String(ticket).trim() === "" || String(ticket).trim() === "-") return false;
+
+            const cleanTP = getCleanTeamPlant(row["TeamPlant"]);
+
+            // TeamPlant filter
+            if (excludeType !== 'teamPlant' && teamPlantFilter && cleanTP !== teamPlantFilter) return false;
+            // PendingUnit filter
+            if (excludeType !== 'pending' && pendingUnitFilter && (row["ค้างหน่วยงาน"] || "") !== pendingUnitFilter) return false;
+            // StockAnswer filter
+            if (excludeType !== 'stock' && stockAnswerFilter && (row["คลังตอบ"] || "") !== stockAnswerFilter) return false;
+            // StatusCall filter (uses StatusX = row-level status, matching original)
+            if (excludeType !== 'status' && statusCallFilter && (row.StatusX || "") !== statusCallFilter) return false;
+
+            // Search term
+            if (searchTerm) {
+                const keyword = searchTerm.toLowerCase().trim();
+                const fields = [
+                    row["DayRepair"], row["DateTime"], row["Ticket Number"],
+                    row["Brand"], row["Equipment"], row["Call Type"], row["Team"],
+                    cleanTP, row["ค้างหน่วยงาน"], row["Material"],
+                    row["Description"], row["Nawa"], row["Vipa"],
+                    row["Request"], row["EngQty"],
+                    row["QtyPlant"], row["OtherPlant"], row["คลังตอบ"],
+                    row["UserAns"], row["วันที่ตอบ"], row["StatusCall"]
+                ];
+                const match = fields.some(f => f && String(f).toLowerCase().includes(keyword));
+                if (!match) return false;
+            }
+
+            if (excludeType !== 'gm' && gmFilter && row.GM !== gmFilter) return false;
+            if (excludeType !== 'dept' && deptGroupFilter && !matchesDeptGroup(row["ค้างหน่วยงาน"], deptGroupFilter)) return false;
+
+            return true;
+        });
+    }, [processedData, teamPlantFilter, pendingUnitFilter, stockAnswerFilter, statusCallFilter, searchTerm, gmFilter, deptGroupFilter]);
+
+    // Apply dashboard card filter (matching original applyDashboardFilter)
+    const applyDashboardFilter = useCallback((data, filter) => {
+        if (!filter || !data) return data;
+
+        switch (filter) {
+            case 'pending': return data.filter(row => (row.StatusCall || "") === "รอของเข้า");
+            case 'success': return data.filter(row => (row.StatusCall || "") === "ระหว่างขนส่ง");
+            case 'waitingResponse': return data.filter(row => (row["คลังตอบ"] || "") === "รอตรวจสอบ");
+            case 'over7': return data.filter(row => parseFloat(row["DayRepair"] || 0) > 7);
+            case 'request': return data.filter(row => (row.StatusCall || "") === "ขอซื้อขอซ่อม");
+            case 'otherPlant': return data.filter(row => (row.StatusCall || "") === "ดึงจากคลังอื่น");
+            case 'newPart': return data.filter(row => (row.StatusCall || "") === "เปิดรหัสใหม่");
+            case 'exceedLeadtime': return data.filter(row => (row.StatusCall || "") === "เกินLeadtime");
+            case 'nawaVipa': return data.filter(row => (row.StatusCall || "") === "เบิกศูนย์อะไหล่");
+            case 'spacial': return data.filter(row => (row.StatusCall || "") === "SPACIAL");
+            default:
+                if (filter.startsWith && filter.startsWith('calltype_')) {
+                    const typeName = filter.replace('calltype_', '');
+                    return data.filter(row => (row["Call Type"] || "") === typeName);
+                }
+                return data;
+        }
+    }, []);
+
+    // Final filtered data (base + dashboard)
+    const baseFilteredData = useMemo(() => getFilteredData(null), [getFilteredData]);
+    const filteredData = useMemo(() => applyDashboardFilter([...baseFilteredData], dashboardFilter), [baseFilteredData, dashboardFilter, applyDashboardFilter]);
+
+    // Summary calculation optimized for hierarchical/faceted view
+    const summary = useMemo(() => {
+        // 1. GM Stats: Filtered by everything EXCEPT GM filter (so we see all GMs)
+        const gmData = getFilteredData('gm');
+        const gmSummary = calculateSummary(gmData);
+
+        // 1b. Dept Group Stats: Filtered by everything EXCEPT dept filter (so we see all Dept Groups)
+        const deptData = getFilteredData('dept');
+        const deptSummary = calculateSummary(deptData);
+
+        // 2. Dashboard Stats (Main cards): Filtered by GM selection and Dept Group selection
+        const dashboardSummary = calculateSummary(baseFilteredData);
+
+        // 3. Call Type Stats: Filtered by GM, Dept Group and ONLY Status (so other Call Type cards stay visible)
+        const statusOnlyFilter = (dashboardFilter && !dashboardFilter.startsWith('calltype_')) ? dashboardFilter : null;
+        const statusOnlyFilteredData = applyDashboardFilter([...baseFilteredData], statusOnlyFilter);
+        const callTypeSummary = calculateSummary(statusOnlyFilteredData);
+
+        return {
+            ...dashboardSummary, // Main stats from GM & Dept-filtered data
+            gmStats: gmSummary.gmStats, // GM cards from all-GM data
+            deptGroupStats: deptSummary.deptGroupStats, // Dept group cards from all-dept data
+            callTypeStats: callTypeSummary.callTypeStats // Call Type cards from fully filtered data
+        };
+    }, [getFilteredData, baseFilteredData, applyDashboardFilter, dashboardFilter]);
+
+    // Cross-filtered data for each filter panel
+    const teamPlantFilterData = useMemo(() => applyDashboardFilter(getFilteredData('teamPlant'), dashboardFilter), [getFilteredData, dashboardFilter, applyDashboardFilter]);
+    const pendingFilterData = useMemo(() => applyDashboardFilter(getFilteredData('pending'), dashboardFilter), [getFilteredData, dashboardFilter, applyDashboardFilter]);
+    const stockFilterData = useMemo(() => applyDashboardFilter(getFilteredData('stock'), dashboardFilter), [getFilteredData, dashboardFilter, applyDashboardFilter]);
+    const statusFilterData = useMemo(() => applyDashboardFilter(getFilteredData('status'), dashboardFilter), [getFilteredData, dashboardFilter, applyDashboardFilter]);
+
+    // Compute filter options with ticket counts (matching original)
+    const computeFilterOptions = useCallback((data, field, transform) => {
+        const ticketSets = {};
+        data.forEach(row => {
+            let val = transform ? transform(row) : (row[field] || "");
+            const ticket = row["Ticket Number"];
+            if (val && ticket) {
+                if (!ticketSets[val]) ticketSets[val] = new Set();
+                ticketSets[val].add(ticket);
+            }
+        });
+        const counts = {};
+        Object.keys(ticketSets).forEach(key => counts[key] = ticketSets[key].size);
+        return counts;
+    }, []);
+
+    const getPendingUnitWaitingStatus = useCallback((data) => {
+        const statusByUnit = {};
+        data.forEach(row => {
+            const unit = String(row["ค้างหน่วยงาน"] || "").trim();
+            if (!unit || unit === "ไม่ระบุ") return;
+            if (!(unit in statusByUnit)) statusByUnit[unit] = false;
+            if (String(row["คลังตอบ"] || "").trim() === "รอตรวจสอบ") {
+                statusByUnit[unit] = true;
+            }
+        });
+        return statusByUnit;
+    }, []);
+
+    const availableFilters = useMemo(() => ({
+        teamPlant: computeFilterOptions(teamPlantFilterData, null, (row) => getCleanTeamPlant(row["TeamPlant"])),
+        pendingUnit: computeFilterOptions(pendingFilterData, "ค้างหน่วยงาน"),
+        pendingUnitHasWaiting: getPendingUnitWaitingStatus(pendingFilterData),
+        stockAnswer: computeFilterOptions(stockFilterData, "คลังตอบ"),
+        statusCall: computeFilterOptions(statusFilterData, null, (row) => row.StatusX || "")
+    }), [teamPlantFilterData, pendingFilterData, stockFilterData, statusFilterData, computeFilterOptions, getPendingUnitWaitingStatus]);
+
+    // Optimistic update for DOM re-render without full fetch
+    const updateRowLocally = useCallback((ticketNumber, material, updates) => {
+        setProcessedData(prevData => {
+            let newData = prevData.map(row => {
+                const tickRow = String(row["Ticket Number"] || "").replace(/^'/, '').trim();
+                let isMatch = tickRow === ticketNumber;
+                if (isMatch && material) {
+                    const matRow = String(row["Material"] || "").replace(/^'/, '').trim();
+                    isMatch = matRow === material;
+                }
+                if (isMatch) {
+                    return { ...row, ...updates };
+                }
+                return row;
+            });
+
+            // Re-evaluate group StatusCall based on new StatusX values
+            const ticketRows = newData.filter(row => String(row["Ticket Number"] || "").replace(/^'/, '').trim() === ticketNumber);
+            if (ticketRows.length > 0) {
+                let newStatusCall = "รอของเข้า";
+                // If it's a project (Answer1 exists and is not "-")
+                if (ticketRows[0].Answer1 && ticketRows[0].Answer1 !== "-") {
+                    newStatusCall = ticketRows[0].StatusCall;
+                } else {
+                    const validRows = ticketRows.filter(r => r.StatusX !== "แจ้งCodeผิด");
+                    const evals = validRows.length > 0 ? validRows : ticketRows;
+
+                    if (evals.some(r => r.StatusX === "เปิดรหัสใหม่")) newStatusCall = "เปิดรหัสใหม่";
+                    else if (evals.some(r => r.StatusX === "ขอซื้อขอซ่อม")) newStatusCall = "ขอซื้อขอซ่อม";
+                    else if (evals.some(r => r.StatusX === "รอของเข้า")) newStatusCall = "รอของเข้า";
+                    else if (evals.some(r => r.StatusX === "เบิกนวนคร" || r.StatusX === "เบิกวิภาวดี")) newStatusCall = "เบิกศูนย์อะไหล่";
+                    else if (evals.some(r => r.StatusX === "ระหว่างขนส่ง")) newStatusCall = "ระหว่างขนส่ง";
+                    else if (ticketRows.some(r => r.StatusX === "แจ้งCodeผิด")) newStatusCall = "แจ้งCodeผิด";
+
+                    if (newStatusCall === "รอของเข้า" || newStatusCall === "ดึงจากคลังอื่น") {
+                        const allOtherPlant = validRows.every(r => {
+                            const op = r["OtherPlant"];
+                            return r.StatusX === "ดึงจากคลังอื่น" || (op !== undefined && op !== null && op !== "" && op !== "-" && op !== 0 && op !== "0");
+                        });
+
+                        if (allOtherPlant && validRows.length > 0) {
+                            newStatusCall = "ดึงจากคลังอื่น";
+                        }
+                    }
+                    if (newStatusCall === "รอของเข้า" || newStatusCall === "ดึงจากคลังอื่น") {
+                        if (validRows.some(r => r.StatusX === "เกินLeadtime")) {
+                            newStatusCall = "เกินLeadtime";
+                        }
+                    }
+                }
+
+                // Apply the re-evaluated group status to all rows of this ticket
+                newData = newData.map(row => {
+                    const tickRow = String(row["Ticket Number"] || "").replace(/^'/, '').trim();
+                    if (tickRow === ticketNumber) {
+                        return { ...row, StatusCall: newStatusCall };
+                    }
+                    return row;
+                });
+            }
+
+            return newData;
+        });
+    }, []);
+
+    return {
+        data: filteredData,
+        allData: processedData,
+        baseFilteredData,
+        isLoading,
+        error,
+        lastUpdated,
+        summary,
+        availableFilters,
+        rawSources,
+        engData: rawSources.engData,
+        // Single-select filters
+        teamPlantFilter, setTeamPlantFilter,
+        pendingUnitFilter, setPendingUnitFilter,
+        stockAnswerFilter, setStockAnswerFilter,
+        statusCallFilter, setStatusCallFilter,
+        searchTerm, setSearchTerm,
+        dashboardFilter, setDashboardFilter,
+        gmFilter, setGmFilter,
+        deptGroupFilter, setDeptGroupFilter,
+        applyDashboardFilter,
+        refreshData: () => fetchData(true, true),
+        refreshDataBackground: () => fetchData(false),
+        updateRowLocally,
+        handleOutsideRequest: async (payload) => {
+            const { material, quantity, plant } = payload;
+            const localKey = normalizeMaterial(material);
+            const localQty = parseFloat(quantity);
+
+            if (!localKey || isNaN(localQty)) {
+                throw new Error("Invalid material or quantity");
+            }
+
+            // 1. Optimistic Update Local Cache (requestQuantities by material)
+            let currentCache = {};
+            try {
+                const cachedPropsText = localStorage.getItem('app_cached_requestQuantities');
+                if (cachedPropsText) {
+                    currentCache = JSON.parse(cachedPropsText);
+                }
+            } catch (e) {
+                console.error("Error reading cache", e);
+            }
+            const previousQty = currentCache[localKey] || 0;
+            currentCache[localKey] = previousQty + localQty;
+            localStorage.setItem('app_cached_requestQuantities', JSON.stringify(currentCache));
+
+            // 1b. Optimistic Update Local Cache (requestQuantities by plant+material)
+            let plantCache;
+            let plantKey;
+            let previousPlantQty;
+            if (plant) {
+                plantCache = {};
+                try {
+                    const plantCacheText = localStorage.getItem('app_cached_requestByPlant');
+                    if (plantCacheText) {
+                        plantCache = JSON.parse(plantCacheText);
+                    }
+                } catch (e) {
+                    console.error("Error reading plant cache", e);
+                }
+                plantKey = `${plant}_${localKey}`;
+                previousPlantQty = plantCache[plantKey] || 0;
+                plantCache[plantKey] = previousPlantQty + localQty;
+                localStorage.setItem('app_cached_requestByPlant', JSON.stringify(plantCache));
+            }
+
+            // Force refresh of the processed data to reflect the new Request quantity
+            // A lightweight way is to re-run the processor on the existing state, but fetchData(false) is safer
+            fetchData(false);
+
+            // Get current user for logging
+            let userStr = '-';
+            try {
+                const u = JSON.parse(localStorage.getItem('user'));
+                userStr = u?.Name || u?.IDRec || '-';
+            } catch (error) {
+                console.error('Unable to read the saved user for request logging:', error);
+            }
+
+            const logPayload = { ...payload, user: userStr };
+            try {
+                await sendOutsideRequest(logPayload);
+                return true;
+            } catch (error) {
+                currentCache[localKey] = previousQty;
+                localStorage.setItem('app_cached_requestQuantities', JSON.stringify(currentCache));
+                if (plantCache && plantKey) {
+                    plantCache[plantKey] = previousPlantQty;
+                    localStorage.setItem('app_cached_requestByPlant', JSON.stringify(plantCache));
+                }
+                fetchData(false);
+                throw error;
+            }
+        }
+    };
+}
